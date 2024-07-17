@@ -83,6 +83,45 @@ void layernorm_forward(float* out, float* mean, float* rstd,
     }
 }
 
+struct {
+    float* out, *inp, *weight, *bias;
+    int B, T, C, OC;
+    int b, t, o;
+} warg; // worker args
+mutex_t lk = MUTEX_INIT();
+cond_t cv = COND_INIT();
+sem_t sem;
+int wexit = 0; // worker thread exit flag
+
+#define NUM_WORKERS 4
+#define CAN_WORK (warg.o < warg.OC)
+
+void matmul_forward_worker() {
+    while (1) {
+        mutex_lock(&lk);
+        while(!CAN_WORK) {
+            cond_wait(&cv, &lk);
+            if (wexit) {
+                mutex_unlock(&lk);
+                return;
+            }
+        }
+        int o = warg.o++;
+        mutex_unlock(&lk);
+
+        float* out_bt = warg.out + warg.b * warg.T * warg.OC + warg.t * warg.OC;
+        float* inp_bt = warg.inp + warg.b * warg.T * warg.C + warg.t * warg.C;
+        float val = (warg.bias != NULL) ? warg.bias[o] : 0.0f;
+        float* wrow = warg.weight + o*warg.C;
+        for (int i = 0; i < warg.C; i++) {
+            val += inp_bt[i] * wrow[i];
+        }
+        out_bt[o] = val;
+
+        sem_post(&sem);
+    }
+}
+
 void matmul_forward(float* out,
                     float* inp, float* weight, float* bias,
                     int B, int T, int C, int OC) {
@@ -92,16 +131,26 @@ void matmul_forward(float* out,
     // out will be (B,T,OC)
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
-            float* out_bt = out + b * T * OC + t * OC;
-            float* inp_bt = inp + b * T * C + t * C;
-            for (int o = 0; o < OC; o++) {
-                float val = (bias != NULL) ? bias[o] : 0.0f;
-                float* wrow = weight + o*C;
-                for (int i = 0; i < C; i++) {
-                    val += inp_bt[i] * wrow[i];
-                }
-                out_bt[o] = val;
+            warg.out = out;
+            warg.inp = inp;
+            warg.weight = weight;
+            warg.bias = bias;
+            warg.B = B;
+            warg.T = T;
+            warg.C = C;
+            warg.b = b;
+            warg.t = t;
+
+            mutex_lock(&lk);
+            warg.OC = OC;
+            warg.o = 0;
+            cond_broadcast(&cv);
+            mutex_unlock(&lk);
+
+            for (int i = 0; i < OC; i++) {
+                sem_wait(&sem);
             }
+            assert(warg.o == warg.OC);
         }
     }
 }
@@ -563,6 +612,11 @@ int sample_mult(float* probabilities, int n) {
 #define GPT2_EOT 50256
 
 int main(int argc, char** argv) {
+    SEM_INIT(&sem, 0);
+    for (int i = 0; i < NUM_WORKERS; i++) {
+        create(matmul_forward_worker);
+    }
+
     GPT2 model;
     gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
     const int n = 10;  // Token limit.
@@ -598,5 +652,7 @@ int main(int argc, char** argv) {
 
     gpt2_free(&model);
 
+    wexit = 1;
+    cond_broadcast(&cv);
     return 0;
 }
